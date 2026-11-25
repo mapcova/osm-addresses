@@ -1,0 +1,7 @@
+/vendor/
+/build/
+*.sqlite
+*.osm.pbf
+.phpunit.cache/
+.php-cs-fixer.cache
+.DS_Store

@@ -1,0 +1,11 @@
+parameters:
+    level: 8
+    paths:
+        - src
+        - tests
+        - bin
+    excludePaths:
+        analyseAndScan:
+            - vendor
+    treatPhpDocTypesAsCertain: false
+    reportUnmatchedIgnoredErrors: true
