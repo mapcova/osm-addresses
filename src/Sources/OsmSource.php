@@ -26,7 +26,9 @@ use MapCova\OsmAddresses\Text\TextNormalizer;
  *   code (British postcodes follow post towns), else the nearest place of the extract within the radius of its type
  *   ({@see PlaceIndex::RADIUS}); an address with none is rejected. District: `addr:suburb`, else `addr:village` or `addr:hamlet`,
  *   when it is not the city.
- * - Postcodes: the street holds the first half, the address the second ({@see self::postcode()}), the street's postcode being shared by all its addresses.
+ * - Postcodes: the street holds the first half, the address the second ({@see self::postcode()}), the street's postcode being shared by all its addresses. The extraction
+ *   gives an address with none the first half most of its street's addresses have (`OsmExtractor`, postcode fill), written alone: it
+ *   reads as a postcode with no second half.
  * - Other languages: the street names `name:<language>` of the extract's highways, found near the address by name, and those of
  *   the city's place node, go to `names` (display) and to `extra` (search). The name without its apostrophes (`St Johns Road`
  *   for `St John's Road`, which the normaliser reads as `st john s road`) goes to `extra` too, for the people who type it so.
@@ -73,7 +75,7 @@ abstract class OsmSource implements ExtractSource
     abstract protected function postcode(string $text): array;
 
     /** Whether the most frequent city of an address's outward code names an address without city (British post towns). */
-    abstract protected function citiesFollowPostcodes(): bool;
+    abstract public function citiesFollowPostcodes(): bool;
 
     /**
      * Whether the extract's `name` is in one of the source's languages (Ireland: Irish or English, by area), so that a name that is
@@ -88,6 +90,11 @@ abstract class OsmSource implements ExtractSource
     protected static function border(): IrelandBorder
     {
         return self::$border ??= IrelandBorder::load();
+    }
+
+    public function postcodeKey(string $text): ?string
+    {
+        return $this->postcode($text)[0];
     }
 
     public function id(): string

@@ -14,13 +14,14 @@ namespace MapCova\OsmAddresses\Sources;
  * and Northern Ireland ({@see self::POSTCODE_AREAS}, `BT` included); `GIR 0AA`, the Crown dependencies' and anything else
  * is no postcode.
  *
- * Measured on Wales (Geofabrik, 151 742 205 bytes, 2026-11-24; 189 606 rows in 29 225 streets, one database of 10 711 040 bytes,
+ * Measured on Wales (Geofabrik, 151 742 205 bytes, 2026-11-24; 189 157 rows in 27 790 streets, one database of 10 387 456 bytes,
  * 10 s on a laptop, 68 MB of memory at the peak) and scaled to the United Kingdom by the number of numbered buildings (taginfo: 5.4 million
- * numbered objects, 2.0 per KB of the extract against 1.2 in Wales, so about 5 million rows). Of the numbered addresses of Wales, 26 %
- * have no postcode, 14 % take their city from the nearest place and 2 % from the post town; the extraction drops 11 % of the objects
- * that have a number (no street or place: 24 591). Streets that have a postcode for some of their addresses and none for the others
- * are 4.97 % of the street rows (5.3 % of the street names): a fill of the missing postcodes from the
- * other rows of the street is not built.
+ * numbered objects, 2.0 per KB of the extract against 1.2 in Wales, so about 5 million rows). Of the numbered addresses of Wales, 15 %
+ * have no postcode once the extraction's postcode fill has run (26 % before it), 11 % take their city from the nearest place and 2 % from the post
+ * town; the extraction drops 11 % of the objects that have a number (no street or place: 24 591). Streets that had a postcode for some of their
+ * addresses and none for the others were 5.3 % of the street names (1 445 of 27 378): the fill (`OsmExtractor`) gives an address without a
+ * postcode the outward code most of its street's addresses have (20 062 addresses in Wales, 0.9 s more of extraction), and 3 street names are
+ * still split (the addresses whose postcode text is not a postcode are left as they are).
  */
 final class GreatBritainSource extends OsmSource
 {
@@ -109,7 +110,7 @@ final class GreatBritainSource extends OsmSource
         return $latE6 >= $minLat && $latE6 <= $maxLat && $lonE6 >= $minLon && $lonE6 <= $maxLon && !self::border()->inRepublic($latE6, $lonE6);
     }
 
-    protected function citiesFollowPostcodes(): bool
+    public function citiesFollowPostcodes(): bool
     {
         return true;
     }
@@ -117,6 +118,11 @@ final class GreatBritainSource extends OsmSource
     protected function postcode(string $text): array
     {
         $compact = strtoupper((string) preg_replace('/\s+/', '', $text));
+
+        // The outward code alone (what the postcode fill writes, and a district some mappers give): a street's postcode with no second half.
+        if (preg_match('/^([A-Z]{1,2})\d[A-Z\d]?$/', $compact, $area) === 1 && in_array($area[1], self::POSTCODE_AREAS, true)) {
+            return [$compact, null];
+        }
 
         if (preg_match('/^(.+)(\d[A-Z]{2})$/', $compact, $match) !== 1 || preg_match('/^([A-Z]{1,2})\d[A-Z\d]?$/', $match[1], $area) !== 1 || !in_array($area[1], self::POSTCODE_AREAS, true)) {
             return [null, null];

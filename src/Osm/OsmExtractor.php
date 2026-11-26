@@ -9,6 +9,7 @@ use MapCova\OsmAddresses\Pbf\Bin;
 use MapCova\OsmAddresses\Pbf\Block;
 use MapCova\OsmAddresses\Pbf\PbfFormatException;
 use MapCova\OsmAddresses\Pbf\PbfReader;
+use MapCova\OsmAddresses\Text\TextNormalizer;
 
 /**
  * Turns an OpenStreetMap PBF extract (sorted: nodes, then ways, then relations) into the TSV of its addresses, in units
@@ -23,6 +24,17 @@ use MapCova\OsmAddresses\Pbf\PbfReader;
  *   of each goes to the bucket file of its slot (`slot >> bucketBits`). Then the PBF and the runs are deleted.
  * - centres: one unit for each bucket of slots: the mean of the positions found is the way's centre, and its line is
  *   written to `addr` (or `names`). A way none of whose nodes was found is dropped. A last unit writes `postcity`.
+ * - postcode fill (when the source gives a way to read a postcode's key): an address with no postcode on a street (same
+ *   name and city) whose other addresses have one is given the key most of them have (the outward code in Britain, the
+ *   routing key in Ireland), so that the street is not split in two by the postcode. Never an address that has one, and
+ *   never the part after the key. Four steps: `fill-load` counts (street, city, key) of the addresses by slices of rows
+ *   into a staging SQLite database (the slice's rows and the offset it reached are one transaction, so a slice is redone
+ *   whole or not at all); `fill-build` picks the majority key of each (street, city) that has addresses of both kinds,
+ *   in one statement over the groups (about one for every ten addresses) that drops and recreates its table; `fill-write`
+ *   copies `addr` to `fill` by slices of rows with the key added; `fill-swap` renames `fill` over `addr`.
+ *   The city that groups an address is the one the source will give it (its own, else the post town of its key, else the
+ *   nearest place); a filled address with no city of its own is given that city, so that the key it received does not
+ *   change it (a key would otherwise name the post town).
  *
  * Every unit is idempotent: the outputs only grow and are cut back to the length the checkpoint recorded, so a unit a
  * kill interrupted is simply done again. Files are named after the chunk's path (`<chunk>.addr.tsv`…), so that the
@@ -38,6 +50,10 @@ final class OsmExtractor
     private const BUCKET_COST = 2.0;
     private const MD5_BYTES_PER_SECOND = 150_000_000;
     private const RUN_KEYS = 1_000_000;
+    private const FILL_LOAD_COST_PER_ROW = 0.000_02;
+    private const FILL_WRITE_COST_PER_ROW = 0.000_015;
+    private const FILL_BUILD_COST = 10.0;
+    private const FILL_SWAP_COST = 1.0;
 
     /** Nodes of a way that stand for its centre: its first, and those a quarter, a half and three quarters round its ring. */
     private const SAMPLES = 4;
@@ -61,6 +77,14 @@ final class OsmExtractor
     /** @var list<string> */
     private readonly array $languages;
 
+    private ?PlaceIndex $places = null;
+
+    /** @var array<string,string> key of a postcode => its most frequent city */
+    private array $postCities = [];
+
+    /** @var array<string,string> city => normalised city */
+    private array $normalised = [];
+
     /**
      * @param string       $pbf           the extract
      * @param list<string> $languages     codes of the languages whose `name:<code>` forms are kept (`ga`, `cy`)
@@ -68,6 +92,9 @@ final class OsmExtractor
      * @param int          $bucketBits    a bucket holds 2^bucketBits way slots
      * @param int          $maxRuns       the scan's runs are merged down to this many before the resolve step
      * @param int          $mergeFan      runs one compaction unit merges
+     * @param int          $fillRows      rows of `addr` a postcode fill unit reads
+     * @param \Closure|null $postcodeKey  the key of the text of a postcode (`SW1A` of `SW1A 1AA`), null when it is not one; without it there is no fill
+     * @param bool         $postcodeCities whether the key of a postcode names a city for an address that gives none (British post towns)
      */
     public function __construct(
         private readonly string $pbf,
@@ -76,6 +103,9 @@ final class OsmExtractor
         private readonly int $bucketBits = 18,
         private readonly int $maxRuns = 200,
         private readonly int $mergeFan = 32,
+        private readonly int $fillRows = 50_000,
+        private readonly ?\Closure $postcodeKey = null,
+        private readonly bool $postcodeCities = false,
     ) {
         $this->languages = array_values(array_filter($languages, static fn (string $code): bool => preg_match('/^[a-z_]+$/', $code) === 1));
         $this->state = ExtractState::load(self::path($pbf, 'osm.json')) ?? new ExtractState();
@@ -148,7 +178,11 @@ final class OsmExtractor
             ExtractState::SCAN => 0.4 * min(1, $this->state->offset / $size),
             ExtractState::COMPACT => 0.4,
             ExtractState::RESOLVE => 0.4 + 0.3 * min(1, $this->state->offset / $size),
-            ExtractState::CENTRES => 0.7 + 0.3 * min(1, $this->state->bucket / $buckets),
+            ExtractState::CENTRES => 0.7 + ($this->postcodeKey === null ? 0.3 : 0.2) * min(1, $this->state->bucket / $buckets),
+            ExtractState::FILL_LOAD => 0.9 + 0.04 * min(1, $this->state->fillOffset / max(1, $this->state->lengths['addr'])),
+            ExtractState::FILL_BUILD => 0.94,
+            ExtractState::FILL_WRITE => 0.94 + 0.05 * min(1, $this->state->fillOffset / max(1, $this->state->lengths['addr'])),
+            ExtractState::FILL_SWAP => 0.99,
             default => 1.0,
         };
     }
@@ -168,10 +202,8 @@ final class OsmExtractor
     {
         try {
             // What a unit killed before its checkpoint wrote past the recorded lengths is cut off, in every output.
-            if ($this->state->step !== ExtractState::VERIFY && $this->state->step !== ExtractState::DONE) {
-                foreach (ExtractState::OUTPUTS as $name) {
-                    $this->file($name);
-                }
+            foreach ($this->outputsOfStep() as $name) {
+                $this->file($name);
             }
 
             while ($this->state->step !== ExtractState::DONE) {
@@ -184,6 +216,10 @@ final class OsmExtractor
                     ExtractState::SCAN => $this->scan(),
                     ExtractState::COMPACT => $this->compact(),
                     ExtractState::RESOLVE => $this->resolve(),
+                    ExtractState::FILL_LOAD => $this->fillLoad(),
+                    ExtractState::FILL_BUILD => $this->fillBuild(),
+                    ExtractState::FILL_WRITE => $this->fillWrite(),
+                    ExtractState::FILL_SWAP => $this->fillSwap(),
                     default => $this->centres(),
                 };
                 $this->commit();
@@ -196,6 +232,22 @@ final class OsmExtractor
         return true;
     }
 
+    /**
+     * The outputs a step appends to, cut back to their recorded length when it starts. After the fill's last step `addr` is
+     * not one of them: it was replaced by `fill`, whose length is not the one the checkpoint holds.
+     *
+     * @return list<string>
+     */
+    private function outputsOfStep(): array
+    {
+        return match ($this->state->step) {
+            ExtractState::VERIFY, ExtractState::DONE, ExtractState::FILL_SWAP => [],
+            ExtractState::FILL_LOAD, ExtractState::FILL_BUILD => ['addr'],
+            ExtractState::FILL_WRITE => ['addr', 'fill'],
+            default => ['addr', 'ways', 'places', 'names'],
+        };
+    }
+
     private function cost(): float
     {
         return match ($this->state->step) {
@@ -203,6 +255,10 @@ final class OsmExtractor
             ExtractState::SCAN => $this->blobsPerUnit * self::SCAN_COST_PER_BLOB,
             ExtractState::COMPACT => self::MERGE_COST,
             ExtractState::RESOLVE => $this->blobsPerUnit * self::RESOLVE_COST_PER_BLOB,
+            ExtractState::FILL_LOAD => $this->fillRows * self::FILL_LOAD_COST_PER_ROW,
+            ExtractState::FILL_BUILD => self::FILL_BUILD_COST,
+            ExtractState::FILL_WRITE => $this->fillRows * self::FILL_WRITE_COST_PER_ROW,
+            ExtractState::FILL_SWAP => self::FILL_SWAP_COST,
             default => self::BUCKET_COST,
         };
     }
@@ -588,7 +644,8 @@ final class OsmExtractor
 
         $this->writePostcity();
         $this->discard[] = self::path($this->pbf, 'ways.tsv');
-        $this->state->step = ExtractState::DONE;
+        $this->state->step = $this->postcodeKey === null ? ExtractState::DONE : ExtractState::FILL_LOAD;
+        $this->state->fillOffset = 0;
     }
 
     private function centresOfBucket(int $bucket): void
@@ -680,6 +737,247 @@ final class OsmExtractor
         }
 
         file_put_contents(self::postcityPath($this->pbf), $out);
+    }
+
+    // --- postcode fill ------------------------------------------------------------------------------------
+
+    private function fillPath(): string
+    {
+        return self::path($this->pbf, 'fill.sqlite');
+    }
+
+    private function staging(): \PDO
+    {
+        $db = new \PDO('sqlite:' . $this->fillPath(), null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $db->exec('PRAGMA synchronous = NORMAL');
+
+        return $db;
+    }
+
+    private function scalar(\PDO $db, string $sql): int
+    {
+        $statement = $db->query($sql);
+
+        return $statement === false ? 0 : (int) $statement->fetchColumn();
+    }
+
+    /** The places and the post towns, read once: they give an address that has no city the one the source will give it. */
+    private function loadCities(): void
+    {
+        if ($this->places !== null) {
+            return;
+        }
+
+        $this->places = is_file(self::placesPath($this->pbf)) ? PlaceIndex::fromFile(self::placesPath($this->pbf)) : new PlaceIndex();
+
+        if (!$this->postcodeCities || !is_file(self::postcityPath($this->pbf))) {
+            return;
+        }
+
+        $lines = file(self::postcityPath($this->pbf), FILE_IGNORE_NEW_LINES) ?: [];
+        array_shift($lines);
+
+        foreach ($lines as $line) {
+            [$key, $city] = array_pad(explode("\t", $line), 2, '');
+            $this->postCities[$key] = $city;
+        }
+    }
+
+    /**
+     * What groups an address: its street, its city as the source will give it (normalised, as the street table keys it) and the
+     * key of its postcode. A row the source would reject (no city) is none, and so is one whose postcode is text that is
+     * not a postcode: it is not an address without one, and is left as it is.
+     *
+     * @param list<string> $fields
+     *
+     * @return array{string,string,string,string}|null street, city key, postcode key (empty for none), the city as written
+     */
+    private function group(array $fields): ?array
+    {
+        $street = $fields[5] !== '' ? $fields[5] : $fields[6];
+        $key = '';
+
+        if ($fields[7] !== '') {
+            $key = $this->postcodeKey === null ? null : ($this->postcodeKey)($fields[7]);
+
+            if ($key === null || $key === '') {
+                return null;
+            }
+        }
+
+        $city = $fields[8];
+
+        if ($city === '' && $key !== '' && $this->postcodeCities) {
+            $city = $this->postCities[$key] ?? '';
+        }
+
+        if ($city === '' && $this->places !== null) {
+            $city = $this->places->nearest((int) $fields[1], (int) $fields[2])['name'] ?? '';
+        }
+
+        if ($city === '' || $street === '') {
+            return null;
+        }
+
+        return [$street, $this->normalised[$city] ??= TextNormalizer::normalize($city), $key, $city];
+    }
+
+    /**
+     * Up to `fillRows` rows of `addr` from an offset.
+     *
+     * @return array{list<array{string,list<string>}>,int,bool} the lines with their fields, the offset after the last, whether the file ended
+     */
+    private function addrRows(int $offset): array
+    {
+        $handle = @fopen(self::addressesPath($this->pbf), 'rb');
+
+        if ($handle === false) {
+            throw new PermanentBuildException('err_osm_state');
+        }
+
+        fseek($handle, $offset);
+        $rows = [];
+        $ended = false;
+
+        while (count($rows) < $this->fillRows) {
+            $line = fgets($handle);
+
+            if ($line === false) {
+                $ended = true;
+                break;
+            }
+
+            $offset += strlen($line);
+            $rows[] = [$line, explode("\t", rtrim($line, "\r\n"))];
+        }
+
+        fclose($handle);
+
+        return [$rows, $offset, $ended];
+    }
+
+    private function fillLoad(): void
+    {
+        $this->loadCities();
+        $db = $this->staging();
+        $db->exec('CREATE TABLE IF NOT EXISTS g (street TEXT NOT NULL, city TEXT NOT NULL, key TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (street, city, key)) WITHOUT ROWID');
+        $db->exec('CREATE TABLE IF NOT EXISTS progress (offset INTEGER NOT NULL)');
+
+        // The database holds the offset it reached with the counts it took: a unit killed before the state was saved is not counted twice.
+        $offset = $this->scalar($db, 'SELECT COALESCE(MAX(offset), 0) FROM progress');
+        [$rows, $next, $ended] = $this->addrRows($offset);
+        $groups = [];
+
+        foreach ($rows as $n => [, $fields]) {
+            // The header is the first line.
+            if ($offset === 0 && $n === 0) {
+                continue;
+            }
+
+            if (($group = $this->group($fields)) !== null) {
+                $id = $group[0] . "\t" . $group[1] . "\t" . $group[2];
+                $groups[$id] = ($groups[$id] ?? 0) + 1;
+            }
+        }
+
+        $db->beginTransaction();
+        $add = $db->prepare('INSERT INTO g (street, city, key, n) VALUES (?, ?, ?, ?) ON CONFLICT (street, city, key) DO UPDATE SET n = n + excluded.n');
+
+        foreach ($groups as $id => $n) {
+            [$street, $city, $key] = explode("\t", (string) $id);
+            $add->execute([$street, $city, $key, $n]);
+        }
+
+        $db->exec('DELETE FROM progress');
+        $db->exec('INSERT INTO progress (offset) VALUES (' . $next . ')');
+        $db->commit();
+
+        $this->state->fillOffset = $next;
+
+        if ($ended) {
+            $this->state->step = ExtractState::FILL_BUILD;
+            $this->state->fillOffset = 0;
+        }
+    }
+
+    private function fillBuild(): void
+    {
+        $db = $this->staging();
+        $db->beginTransaction();
+        $db->exec('DROP TABLE IF EXISTS f');
+        $db->exec('CREATE TABLE f (street TEXT NOT NULL, city TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (street, city)) WITHOUT ROWID');
+        // The most frequent key of each street and city that has addresses with and without one; the smallest on a tie.
+        $db->exec(
+            "INSERT INTO f (street, city, key)
+             SELECT r.street, r.city, r.key FROM (
+                 SELECT street, city, key, ROW_NUMBER() OVER (PARTITION BY street, city ORDER BY n DESC, key) AS rank FROM g WHERE key <> ''
+             ) AS r WHERE r.rank = 1 AND EXISTS (SELECT 1 FROM g AS m WHERE m.street = r.street AND m.city = r.city AND m.key = '')",
+        );
+        $db->commit();
+        $this->state->stats['fill_streets'] = $this->scalar($db, 'SELECT COUNT(*) FROM f');
+        $this->state->step = ExtractState::FILL_WRITE;
+        $this->state->fillOffset = 0;
+    }
+
+    private function fillWrite(): void
+    {
+        $this->loadCities();
+        $db = $this->staging();
+        $find = $db->prepare('SELECT key FROM f WHERE street = ? AND city = ?');
+        [$rows, $next, $ended] = $this->addrRows($this->state->fillOffset);
+        $out = $this->file('fill');
+        $found = [];
+
+        foreach ($rows as $n => [$line, $fields]) {
+            if ($fields[7] !== '' || ($this->state->fillOffset === 0 && $n === 0) || ($group = $this->group($fields)) === null) {
+                $out->write($line);
+                continue;
+            }
+
+            [$street, $city, , $name] = $group;
+            $id = $street . "\t" . $city;
+
+            if (!isset($found[$id])) {
+                $find->execute([$street, $city]);
+                $found[$id] = (string) $find->fetchColumn();
+            }
+
+            if ($found[$id] === '') {
+                $out->write($line);
+                continue;
+            }
+
+            // Only the key, never the part after it; the city it would have had stays.
+            $fields[7] = $found[$id];
+            $fields[8] = $name;
+            $out->write(implode("\t", $fields) . "\n");
+            $this->state->count('postcode_filled');
+        }
+
+        $this->state->fillOffset = $next;
+
+        if ($ended) {
+            $this->state->step = ExtractState::FILL_SWAP;
+        }
+    }
+
+    private function fillSwap(): void
+    {
+        $fill = self::path($this->pbf, 'fill.tsv');
+
+        // Done twice when a kill came between the rename and the checkpoint: then `fill` is already gone.
+        if (is_file($fill)) {
+            if ((int) filesize($fill) !== $this->state->lengths['fill']) {
+                throw new PermanentBuildException('err_osm_state');
+            }
+
+            rename($fill, self::addressesPath($this->pbf));
+        }
+
+        $this->state->lengths['addr'] = $this->state->lengths['fill'];
+        $this->state->lengths['fill'] = 0;
+        $this->discard = [...$this->discard, $this->fillPath(), $this->fillPath() . '-journal'];
+        $this->state->step = ExtractState::DONE;
     }
 
     // --- files and checkpoint -----------------------------------------------------------------------------

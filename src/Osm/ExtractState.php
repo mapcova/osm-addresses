@@ -15,10 +15,14 @@ final class ExtractState
     public const COMPACT = 'compact';
     public const RESOLVE = 'resolve';
     public const CENTRES = 'centres';
+    public const FILL_LOAD = 'fill-load';
+    public const FILL_BUILD = 'fill-build';
+    public const FILL_WRITE = 'fill-write';
+    public const FILL_SWAP = 'fill-swap';
     public const DONE = 'done';
 
     /** @var list<string> the outputs that only grow */
-    public const OUTPUTS = ['addr', 'ways', 'places', 'names'];
+    public const OUTPUTS = ['addr', 'ways', 'places', 'names', 'fill'];
 
     /** Bytes of the PBF file, kept for the progress after it is deleted. */
     public int $size = 0;
@@ -35,8 +39,11 @@ final class ExtractState
     /** Bucket the centres step is at. */
     public int $bucket = 0;
 
+    /** Byte offset in `addr` of the next row the postcode fill reads (progress of its load step; the staging database keeps its own), then of its write step. */
+    public int $fillOffset = 0;
+
     /** @var array<string,int> bytes of each output in {@see self::OUTPUTS} */
-    public array $lengths = ['addr' => 0, 'ways' => 0, 'places' => 0, 'names' => 0];
+    public array $lengths = ['addr' => 0, 'ways' => 0, 'places' => 0, 'names' => 0, 'fill' => 0];
 
     /** @var list<array{id:int,count:int,consumed:int}> sorted run files of pair keys, with the keys the resolve step has taken */
     public array $runs = [];
@@ -85,6 +92,7 @@ final class ExtractState
         $state->ways = $int($data['ways'] ?? 0);
         $state->nextRun = $int($data['nextRun'] ?? 0);
         $state->bucket = $int($data['bucket'] ?? 0);
+        $state->fillOffset = $int($data['fillOffset'] ?? 0);
 
         foreach (self::OUTPUTS as $name) {
             $state->lengths[$name] = $int(is_array($data['lengths'] ?? null) ? ($data['lengths'][$name] ?? 0) : 0);

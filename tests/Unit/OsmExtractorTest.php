@@ -166,6 +166,167 @@ final class OsmExtractorTest extends TestCase
         }
     }
 
+    /** The key the fill uses in these tests: the outward code of a British postcode. */
+    private static function key(): \Closure
+    {
+        return static fn (string $text): ?string => AddressTags::outward($text);
+    }
+
+    /**
+     * Streets A Road (three addresses with AB1, one with CD2, two without, one with a text that is no postcode), B Road (a tie
+     * between EF3 and AB1, one without), a street with no postcode at all, A Road of another city with none, an address with no
+     * city that the nearest place names, and a named house.
+     */
+    private static function fillWriter(): PbfWriter
+    {
+        $w = new PbfWriter(3, 2);
+        $w->node(1, 52.0, -1.0, ['place' => 'city', 'name' => 'Xtown']);
+        $w->node(2, 52.0, -1.0001, ['addr:housenumber' => '1', 'addr:street' => 'A Road', 'addr:postcode' => 'AB1 1AA', 'addr:city' => 'Xtown']);
+        $w->node(3, 52.0, -1.0002, ['addr:housenumber' => '2', 'addr:street' => 'A Road', 'addr:postcode' => 'AB1 1AB', 'addr:city' => 'Xtown']);
+        $w->node(4, 52.0, -1.0003, ['addr:housenumber' => '3', 'addr:street' => 'A Road', 'addr:postcode' => 'ab1 2cd', 'addr:city' => 'Xtown']);
+        $w->node(5, 52.0, -1.0004, ['addr:housenumber' => '4', 'addr:street' => 'A Road', 'addr:postcode' => 'CD2 1AA', 'addr:city' => 'Xtown']);
+        $w->node(6, 52.0, -1.0005, ['addr:housenumber' => '5', 'addr:street' => 'A Road', 'addr:city' => 'Xtown']);
+        $w->node(7, 52.0, -1.0006, ['addr:housenumber' => '6', 'addr:street' => 'A Road', 'addr:city' => 'Xtown']);
+        $w->node(8, 52.0, -1.0007, ['addr:housenumber' => '7', 'addr:street' => 'A Road', 'addr:postcode' => 'not a postcode', 'addr:city' => 'Xtown']);
+        $w->node(9, 52.0, -1.0008, ['addr:housenumber' => '1', 'addr:street' => 'B Road', 'addr:postcode' => 'EF3 3CC', 'addr:city' => 'Xtown']);
+        $w->node(10, 52.0, -1.0009, ['addr:housenumber' => '2', 'addr:street' => 'B Road', 'addr:postcode' => 'AB1 1AA', 'addr:city' => 'Xtown']);
+        $w->node(11, 52.0, -1.0010, ['addr:housenumber' => '3', 'addr:street' => 'B Road', 'addr:city' => 'Xtown']);
+        $w->node(12, 52.0, -1.0011, ['addr:housenumber' => '1', 'addr:street' => 'C Road', 'addr:city' => 'Xtown']);
+        $w->node(13, 52.0, -1.0012, ['addr:housenumber' => '9', 'addr:street' => 'A Road', 'addr:city' => 'Ytown']);
+        // No city of its own: the nearest place, Xtown, so it belongs to A Road of Xtown and has the same city after the fill.
+        $w->node(14, 52.0, -1.0013, ['addr:housenumber' => '8', 'addr:street' => 'A Road']);
+        $w->node(15, 52.0, -1.0014, ['addr:housename' => 'The Barn', 'addr:street' => 'A Road', 'addr:city' => 'Xtown']);
+
+        return $w;
+    }
+
+    /** @return array<string,array<string,string>> addresses by `id/number` */
+    private function byId(string $path): array
+    {
+        $byId = [];
+
+        foreach (OsmExtractFixtures::records(OsmExtractor::addressesPath($path)) as $record) {
+            $byId[$record['id'] . '/' . $record['number']] = $record;
+        }
+
+        return $byId;
+    }
+
+    public function testAnAddressWithoutPostcodeTakesTheMajorityKeyOfItsStreetAndCity(): void
+    {
+        [, $path] = $this->extract(self::fillWriter());
+        $extractor = new OsmExtractor($path, [], 1000, postcodeKey: self::key());
+        $this->drive($extractor);
+        $byId = $this->byId($path);
+        $pc = static fn (string $id): array => [$byId[$id]['postcode'], $byId[$id]['city']];
+
+        // Majority: AB1 (three) over CD2 (one); the addresses that had none, a named house and one whose city is the nearest place included.
+        foreach (['n6/5', 'n7/6', 'n14/8', 'n15/'] as $id) {
+            self::assertSame(['AB1', 'Xtown'], $pc($id), $id);
+        }
+
+        // Tie between EF3 and AB1: the smallest.
+        self::assertSame(['AB1', 'Xtown'], $pc('n11/3'));
+        // What had a postcode keeps it whole, the fill never writes an inward code, a text that is no postcode is left alone.
+        self::assertSame('ab1 2cd', $byId['n4/3']['postcode']);
+        self::assertSame('CD2 1AA', $byId['n5/4']['postcode']);
+        self::assertSame('not a postcode', $byId['n8/7']['postcode']);
+        // No postcode in the street, or none in the street of that city: untouched.
+        self::assertSame('', $byId['n12/1']['postcode']);
+        self::assertSame(['', 'Ytown'], $pc('n13/9'));
+        self::assertSame(5, $extractor->stats()['postcode_filled']);
+        self::assertSame(2, $extractor->stats()['fill_streets']);
+        self::assertSame('done', $extractor->step());
+
+        // Everything else of a row is as it was, and the file is whole.
+        $plain = $this->extract(self::fillWriter());
+        $this->drive(new OsmExtractor($plain[1], [], 1000));
+        self::assertCount(count($this->byId($plain[1])), $byId);
+        self::assertSame($this->byId($plain[1])['n6/5']['lat_e6'], $byId['n6/5']['lat_e6']);
+        self::assertSame([], glob($path . '.fill.*') ?: [], 'the staging database and the copy go');
+    }
+
+    public function testTheFillIsOffWithoutAWayToReadAPostcodeKey(): void
+    {
+        [, $path] = $this->extract(self::fillWriter());
+        $extractor = new OsmExtractor($path, [], 1000);
+        $this->drive($extractor);
+
+        self::assertSame('', $this->byId($path)['n6/5']['postcode']);
+        self::assertArrayNotHasKey('postcode_filled', $extractor->stats());
+    }
+
+    public function testTheFillGivesTheSameFilesWhateverTheSliceAndEvenWhenEveryFillUnitIsDoneTwice(): void
+    {
+        [, $path] = $this->extract(self::fillWriter());
+        $this->drive(new OsmExtractor($path, [], 1000, postcodeKey: self::key()));
+        $expected = OsmExtractFixtures::outputs($path);
+        self::assertStringContainsString("\tAB1\t", (string) $expected['addr.tsv']);
+
+        foreach ([1, 2, 5, 1000] as $rows) {
+            [, $path] = $this->extract(self::fillWriter());
+
+            for ($guard = 0; !$this->isDone($path) && $guard < 500; ++$guard) {
+                $this->drive(new OsmExtractor($path, [], 1000, 1, 200, 2, $rows, self::key()), static fn (int $unit): bool => $unit < 1);
+            }
+
+            self::assertSame($expected, OsmExtractFixtures::outputs($path), "fill rows $rows");
+            self::assertSame([], glob($path . '.fill.*') ?: []);
+        }
+
+        // A unit of the fill killed after its work was committed, before the state was saved, is done again: the database and the copy
+        // are back to the state of the checkpoint, the file renamed is not renamed twice.
+        foreach ([1, 3, 1000] as $rows) {
+            [, $path] = $this->extract(self::fillWriter());
+            $redone = 0;
+
+            for ($guard = 0; !$this->isDone($path) && $guard < 500; ++$guard) {
+                $before = (string) @file_get_contents($path . '.osm.json');
+                $this->drive(new OsmExtractor($path, [], 1000, 1, 200, 2, $rows, self::key()), static fn (int $unit): bool => $unit < 1);
+
+                if (str_starts_with((string) (json_decode($before, true)['step'] ?? ''), 'fill-')) {
+                    file_put_contents($path . '.osm.json', $before);
+                    $this->drive(new OsmExtractor($path, [], 1000, 1, 200, 2, $rows, self::key()), static fn (int $unit): bool => $unit < 1);
+                    ++$redone;
+                }
+            }
+
+            self::assertGreaterThanOrEqual(4, $redone);
+            self::assertSame($expected, OsmExtractFixtures::outputs($path), "redone, fill rows $rows");
+        }
+    }
+
+    public function testWhatAKilledFillUnitLeftBehindIsCutOff(): void
+    {
+        [, $path] = $this->extract(self::fillWriter());
+        $this->drive(new OsmExtractor($path, [], 1000, postcodeKey: self::key()));
+        $expected = OsmExtractFixtures::outputs($path);
+
+        // Stop in each fill step, append garbage to the rows as a unit killed before its checkpoint would have, and carry on.
+        foreach ([0, 1, 2, 3, 4] as $extra) {
+            [, $path] = $this->extract(self::fillWriter());
+            $units = 0;
+
+            while (!in_array((string) (new OsmExtractor($path))->step(), ['fill-load', 'fill-build', 'fill-write', 'fill-swap'], true)) {
+                $this->drive(new OsmExtractor($path, [], 1000, 1, 200, 2, 3, self::key()), static fn (int $unit): bool => $unit < 1);
+                ++$units;
+            }
+
+            for ($i = 0; $i < $extra; ++$i) {
+                $this->drive(new OsmExtractor($path, [], 1000, 1, 200, 2, 3, self::key()), static fn (int $unit): bool => $unit < 1);
+            }
+
+            foreach (['.addr.tsv', '.fill.tsv'] as $suffix) {
+                if (is_file($path . $suffix) && !$this->isDone($path)) {
+                    file_put_contents($path . $suffix, "garbage\tgarbage\n", FILE_APPEND);
+                }
+            }
+
+            $this->drive(new OsmExtractor($path, [], 1000, 1, 200, 2, 3, self::key()));
+            self::assertSame($expected, OsmExtractFixtures::outputs($path), "killed $extra units into the fill");
+        }
+    }
+
     public function testAMissingOrShortWorkFileIsRefused(): void
     {
         [, $path] = $this->extract();

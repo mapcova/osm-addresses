@@ -518,7 +518,7 @@ final class DatasetBuilder
     private function extract(BuildState $state): bool
     {
         $path = $this->path($state, '.chunk');
-        $extractor = new OsmExtractor($path, $this->source->languages(), $this->extractBlobs);
+        $extractor = new OsmExtractor($path, $this->source->languages(), $this->extractBlobs, postcodeKey: $this->source->postcodeKey(...), postcodeCities: $this->source->citiesFollowPostcodes());
 
         // The file is gone (the build folder was cleaned): fetch it again, which counts against the resets.
         if ($extractor->needsPbf() && !is_file($path)) {

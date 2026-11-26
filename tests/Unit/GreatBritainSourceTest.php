@@ -77,13 +77,25 @@ final class GreatBritainSourceTest extends TestCase
     {
         $source = new GreatBritainSource();
 
-        foreach (['GIR 0AA', 'IM1 1AA', 'JE2 3AB', 'GY1 1AA', 'ZZ9 9ZZ', 'SW1A', '12345', 'SW1A 1A', 'SW1A 11A', 'SW1AA 1AA'] as $text) {
+        foreach (['GIR 0AA', 'IM1 1AA', 'JE2 3AB', 'GY1 1AA', 'ZZ9 9ZZ', 'ZZ1', '12345', 'SW1A 1A', 'SW1A 11A', 'SW1AA 1AA'] as $text) {
             $row = $this->row(['number' => '1', 'postcode' => $text], $source);
             self::assertNotNull($row, $text);
             self::assertSame([null, null], [$row->postcode, $row->pc], $text);
         }
 
         self::assertSame(10, $source->tallies()['bad_postcode']);
+    }
+
+    public function testAnOutwardCodeAloneIsAStreetPostcodeWithNoInwardCode(): void
+    {
+        foreach (['SW1A' => 'SW1A', ' cf10 ' => 'CF10', 'M1' => 'M1', 'B33' => 'B33'] as $text => $outward) {
+            $row = $this->row(['number' => '1', 'postcode' => (string) $text]);
+            self::assertSame([$outward, null], [$row?->postcode, $row?->pc], (string) $text);
+        }
+
+        self::assertSame('SW1A', (new GreatBritainSource())->postcodeKey('SW1A 1AA'));
+        self::assertSame('SW1A', (new GreatBritainSource())->postcodeKey('SW1A'));
+        self::assertNull((new GreatBritainSource())->postcodeKey('GIR 0AA'));
     }
 
     public function testTheCityComesFromTheTagsThenThePostcodeThenTheNearestPlace(): void

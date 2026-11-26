@@ -19,4 +19,14 @@ interface ExtractSource extends ReaderSource
      * @return list<string>
      */
     public function languages(): array;
+
+    /**
+     * The key of the text of a postcode, the part of it that names the street's postcode (`SW1A` of `SW1A 1AA`, `D02` of `D02 X285`),
+     * or null when the text is no postcode. The extraction gives an address that has none the key most of its street's addresses
+     * have (see `OsmExtractor`), and writes it as the postcode text: the source must read a key alone as a postcode.
+     */
+    public function postcodeKey(string $text): ?string;
+
+    /** Whether the key of a postcode names a city for an address that gives none (British post towns). */
+    public function citiesFollowPostcodes(): bool;
 }
