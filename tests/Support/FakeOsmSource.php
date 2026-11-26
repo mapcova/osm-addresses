@@ -119,7 +119,9 @@ final class FakeOsmSource implements ExtractSource
 
     public function postcodeKey(string $text): ?string
     {
-        return AddressTags::outward($text) ?? (preg_match('/^[A-Z]{1,2}\d[A-Z\d]?$/', $text) === 1 ? $text : null);
+        $key = strtoupper((string) preg_replace('/\s+/', '', $text));
+
+        return AddressTags::outward($key) ?? (preg_match('/^[A-Z]{1,2}\d[A-Z\d]?$/', $key) === 1 ? $key : null);
     }
 
     public function citiesFollowPostcodes(): bool

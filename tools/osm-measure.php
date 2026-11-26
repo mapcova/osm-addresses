@@ -120,9 +120,12 @@ while (!$state->isDone()) {
             [$peakDisk, $peakPhase] = [$bytes, $s->phase];
         }
 
-        foreach (glob($dir . '/.build/*.chunk.osm.json') ?: [] as $file) {
-            $saved = json_decode((string) file_get_contents($file), true);
-            $stats = $saved['stats'] ?? $stats;
+        // The work folder is new for each run, so it holds one build and at most one extraction state.
+        $file = (glob($dir . '/.build/*.chunk.osm.json') ?: [])[0] ?? null;
+        $saved = $file === null ? null : json_decode((string) file_get_contents($file), true);
+
+        if (\is_array($saved)) {
+            $stats = \is_array($saved['stats'] ?? null) ? $saved['stats'] : $stats;
 
             // The unit that just ended belonged to the step the file held before it.
             if ($s->phase === BuildState::EXTRACT) {
