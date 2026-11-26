@@ -22,11 +22,12 @@ The build reads one extract and writes one SQLite file, in these passes:
 
 1. **Verify and scan.** The PBF file (nodes, then ways, then relations) is read blob by blob, in memory that does not grow with the extract. Nodes and ways that carry `addr:housenumber` or `addr:housename` with a street (`addr:street`) or a place (`addr:place`) are addresses. Place nodes (`city`, `town`, `village`, `hamlet`) are kept for the city rules below. Streets that have a name in another language are kept for the name forms. Relations are not read.
 2. **Resolve and centres.** The position of a way is the mean of up to four of its nodes (its first, and those a quarter, a half and three quarters round its ring): the node blobs are read a second time to find them. A way none of whose nodes is found is dropped.
-3. **Ingest.** The extracted addresses are read as a TSV and each is turned into a row by the country's rules (below) or rejected. Rows are cut into buckets by street.
-4. **Finalize.** Each bucket is sorted by street, number and suffix, and the addresses are numbered so that the addresses of a street are contiguous. Addresses of the same street with the same number and suffix are one (a shop and its building): the first one read stays.
-5. **Streets.** The addresses are aggregated into streets (a street is a name, a postcode and a city). Streets are ranked by the number of their addresses and of their city's, and an R-Tree of their extent is built.
-6. **Search text.** The text of each street (name, postcode, city, district, other-language forms) is normalised (lower case, no diacritics, punctuation to space) and indexed with SQLite FTS5.
-7. **Verify and publish.** An integrity check, a count, the `meta` table, `ANALYZE`, and an atomic rename.
+3. **Postcode fill.** An address with no postcode is given the postcode key (GB: the outward code, `SW1A`; IE: the routing key, `D02`) that most of the addresses of its street and city have, when at least one of them has one (a tie goes to the smallest key). The street is then one row instead of two. The part after the key (the inward code, the Eircode's identifier) is never invented, an address that has a postcode is never touched, and text that is not a postcode is left alone. The counts of (street, city, key) go to a staging SQLite table in slices of rows, the majority of each group is picked in one statement over the groups, `addr` is copied with the keys added in slices, and the copy replaces it. An address that gave no city of its own keeps the city it would have had.
+4. **Ingest.** The extracted addresses are read as a TSV and each is turned into a row by the country's rules (below) or rejected. Rows are cut into buckets by street.
+5. **Finalize.** Each bucket is sorted by street, number and suffix, and the addresses are numbered so that the addresses of a street are contiguous. Addresses of the same street with the same number and suffix are one (a shop and its building): the first one read stays.
+6. **Streets.** The addresses are aggregated into streets (a street is a name, a postcode and a city). Streets are ranked by the number of their addresses and of their city's, and an R-Tree of their extent is built.
+7. **Search text.** The text of each street (name, postcode, city, district, other-language forms) is normalised (lower case, no diacritics, punctuation to space) and indexed with SQLite FTS5.
+8. **Verify and publish.** An integrity check, a count, the `meta` table, `ANALYZE`, and an atomic rename.
 
 The units of a build are small and idempotent, so a build can be stopped after any one and resumed from its saved state; the result is the same as a continuous build (the tests check it after every unit).
 
@@ -81,9 +82,9 @@ Streets are numbered in rank order (the largest city and the longest street firs
 
 ## Known limits
 
-- OpenStreetMap has about one address in five in Great Britain, and no national address file is used: the databases are as complete as the map. In Wales, 26 % of the numbered addresses have no postcode, 14 % take their city from the nearest place and 2 % from the post town; the extraction drops 11 % of the objects that have a number because they have no street and no place.
+- OpenStreetMap has about one address in five in Great Britain, and no national address file is used: the databases are as complete as the map. In Wales, 15 % of the numbered addresses have no postcode once the postcode fill has run (26 % before it), 11 % take their city from the nearest place and 2 % from the post town; the extraction drops 11 % of the objects that have a number because they have no street and no place.
 - In Ireland, most streets have no Eircode (Cork: 90 % of the numbered addresses have no postcode) and 40 % of the cities come from the nearest place.
-- A street that has a postcode for some of its addresses and none for the others is two street rows. Nothing fills the missing postcodes from the other rows.
+- A filled address shows the postcode district of its street (`SW1A`) with no second half, as the addresses whose own postcode is only a district do, although OpenStreetMap gives that address no postcode. A street whose addresses have postcodes in several districts stays one row per district; an address with no postcode on it takes the district most of the others have.
 - The position of a way is the mean of up to four of its nodes, not its centroid.
 - Addresses mapped on relations (multipolygon buildings) are not read (0.06 % of the addresses of the extracts measured).
 - The border is a polygon simplified to 10 m: an address within that distance of the border may fall on the wrong side.

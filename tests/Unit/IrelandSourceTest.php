@@ -44,6 +44,11 @@ final class IrelandSourceTest extends TestCase
             self::assertSame([$key, $unique], [$row?->postcode, $row?->pc], (string) $text);
         }
 
+        self::assertSame('D02', (new IrelandSource())->postcodeKey('D02 X285'));
+        self::assertSame('D02', (new IrelandSource())->postcodeKey('D02'));
+        self::assertSame('D02', (new IrelandSource())->postcodeKey('Dublin 2'));
+        self::assertNull((new IrelandSource())->postcodeKey('X1'));
+
         // A routing key alone is the street's.
         self::assertSame(['T23', null], [$this->row(['number' => '1', 'postcode' => 'T23'])?->postcode, $this->row(['number' => '1', 'postcode' => 'T23'])?->pc]);
     }

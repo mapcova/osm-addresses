@@ -95,7 +95,7 @@ final class IrelandSource extends OsmSource
         return $latE6 >= $minLat && $latE6 <= $maxLat && $lonE6 >= $minLon && $lonE6 <= $maxLon && !self::border()->contains($latE6, $lonE6);
     }
 
-    protected function citiesFollowPostcodes(): bool
+    public function citiesFollowPostcodes(): bool
     {
         return false;
     }

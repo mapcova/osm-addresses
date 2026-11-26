@@ -7,6 +7,7 @@ namespace MapCova\OsmAddresses\Tests\Support;
 use MapCova\OsmAddresses\Build\RecordReader;
 use MapCova\OsmAddresses\Build\SourceFormatException;
 use MapCova\OsmAddresses\Build\TsvRecordReader;
+use MapCova\OsmAddresses\Osm\AddressTags;
 use MapCova\OsmAddresses\Osm\OsmExtractor;
 use MapCova\OsmAddresses\Osm\PlaceIndex;
 use MapCova\OsmAddresses\Sources\AddressRow;
@@ -114,6 +115,16 @@ final class FakeOsmSource implements ExtractSource
     public function languages(): array
     {
         return ['cy'];
+    }
+
+    public function postcodeKey(string $text): ?string
+    {
+        return AddressTags::outward($text) ?? (preg_match('/^[A-Z]{1,2}\d[A-Z\d]?$/', $text) === 1 ? $text : null);
+    }
+
+    public function citiesFollowPostcodes(): bool
+    {
+        return false;
     }
 
     public function reader(string $path, Chunk $chunk): RecordReader

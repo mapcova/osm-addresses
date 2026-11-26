@@ -100,6 +100,8 @@ $peakDisk = 0;
 $peakPhase = '';
 $slices = 0;
 $stats = [];
+$steps = [];
+$previous = 'verify';
 $began = microtime(true);
 $mark = $began;
 $last = $state->phase;
@@ -107,9 +109,10 @@ $last = $state->phase;
 while (!$state->isDone()) {
     $state = BuildState::fromArray($state->toArray());
     $budget->refill();
-    $state = $builder->run($state, $budget, function (BuildState $s) use ($dir, &$seconds, &$peakDisk, &$peakPhase, &$mark, &$stats): void {
+    $state = $builder->run($state, $budget, function (BuildState $s) use ($dir, &$seconds, &$peakDisk, &$peakPhase, &$mark, &$stats, &$steps, &$previous): void {
         $now = microtime(true);
         $seconds[$s->phase] = ($seconds[$s->phase] ?? 0.0) + $now - $mark;
+        $elapsed = $now - $mark;
         $mark = $now;
         $bytes = folderBytes($dir);
 
@@ -118,7 +121,14 @@ while (!$state->isDone()) {
         }
 
         foreach (glob($dir . '/.build/*.chunk.osm.json') ?: [] as $file) {
-            $stats = json_decode((string) file_get_contents($file), true)['stats'] ?? $stats;
+            $saved = json_decode((string) file_get_contents($file), true);
+            $stats = $saved['stats'] ?? $stats;
+
+            // The unit that just ended belonged to the step the file held before it.
+            if ($s->phase === BuildState::EXTRACT) {
+                $steps[$previous] = ($steps[$previous] ?? 0.0) + $elapsed;
+                $previous = (string) ($saved['step'] ?? $previous);
+            }
         }
     });
     ++$slices;
@@ -138,6 +148,7 @@ $final = (int) filesize(DatasetBuilder::finalPath($dir, $country));
 printf("%s from %s (%s)\n", $country, basename($pbf), mb($size));
 printf("slices of %.0f s: %d; wall %.1f s; peak memory %s\n", $slice, $slices, $total, mb(memory_get_peak_usage(true)));
 printf("seconds per phase (wall): %s\n", implode(', ', array_map(static fn (string $p, float $s): string => sprintf('%s %.1f', $p, $s), array_keys($seconds), $seconds)));
+printf("seconds per extraction step (wall): %s\n", implode(', ', array_map(static fn (string $p, float $s): string => sprintf('%s %.1f', $p, $s), array_keys($steps), $steps)));
 printf("peak disk of the work folder: %s at the end of %s (final database %s, ratio %.3f of the extract)\n", mb($peakDisk), $peakPhase, mb($final), $final / $size);
 printf("peak disk over extract: %.2f\n", $peakDisk / $size);
 printf("rows %s, streets %d (%d distinct names per city), rejected at ingest %s\n", $meta['rows'] ?? '?', $streets, $distinct, $meta['rejected'] ?? '?');
@@ -148,5 +159,6 @@ if ($numbered > 0) {
     printf("numbered addresses without a postcode: %.1f %%; city from the postcode's post town: %.1f %%, from the nearest place: %.1f %%\n", 100 * ($tallies['no_postcode'] ?? 0) / $numbered, 100 * ($tallies['city_from_postcode'] ?? 0) / $numbered, 100 * ($tallies['city_from_place'] ?? 0) / $numbered);
 }
 
-printf("streets with and without postcode under one name and city: %d of %d (%.1f %%): step E needed above 5 %%\n", $split, $distinct, $distinct === 0 ? 0 : 100 * $split / $distinct);
+printf("postcode fill: %d addresses given the key of their street, on %d (street, city) groups\n", $stats['postcode_filled'] ?? 0, $stats['fill_streets'] ?? 0);
+printf("streets with and without postcode under one name and city: %d of %d (%.1f %%) (left split after the postcode fill)\n", $split, $distinct, $distinct === 0 ? 0 : 100 * $split / $distinct);
 printf("database kept at %s\n", DatasetBuilder::finalPath($dir, $country));
